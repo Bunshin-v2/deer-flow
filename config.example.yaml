@@ -585,6 +585,35 @@ checkpointer:
 #   connection_string: postgresql://user:password@localhost:5432/deerflow
 
 # ============================================================================
+# Database
+# ============================================================================
+# Unified storage backend for LangGraph checkpointer and DeerFlow
+# application data (runs, threads metadata, etc.).
+#
+# backend: memory  -- No persistence, data lost on restart (default)
+# backend: sqlite  -- Single-node deployment, files in sqlite_dir
+# backend: postgres -- Production multi-node deployment
+#
+# SQLite mode automatically uses separate .db files for checkpointer
+# and application data to avoid write-lock contention.
+#
+# Postgres mode: put your connection URL in .env as DATABASE_URL,
+# then reference it here with $DATABASE_URL.
+# Install the postgres driver: uv sync --extra postgres
+#
+# NOTE: When both `checkpointer` and `database` are configured,
+# `checkpointer` takes precedence for LangGraph state persistence.
+# If you use `database`, you can remove the `checkpointer` section.
+#
+# database:
+#   backend: sqlite
+#   sqlite_dir: ./data
+#
+# database:
+#   backend: postgres
+#   postgres_url: $DATABASE_URL
+
+# ============================================================================
 # IM Channels Configuration
 # ============================================================================
 # Connect DeerFlow to external messaging platforms.
