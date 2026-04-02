@@ -14,6 +14,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 
 from deerflow.runtime import RunManager, StreamBridge
+from deerflow.runtime.events.store.base import RunEventStore
 from deerflow.runtime.runs.store.base import RunStore
 
 
@@ -45,6 +46,12 @@ async def langgraph_runtime(app: FastAPI) -> AsyncGenerator[None, None]:
         # Initialize run store (MemoryRunStore for now; switch to ORM-backed
         # RunRepository when models are implemented)
         app.state.run_store = MemoryRunStore()
+
+        # Initialize run event store (MemoryRunEventStore for now)
+        # TODO(Phase 2-B): switch to db/jsonl backend based on config.run_events.backend
+        from deerflow.runtime.events.store.memory import MemoryRunEventStore
+
+        app.state.run_event_store = MemoryRunEventStore()
 
         try:
             yield
@@ -84,6 +91,14 @@ def get_checkpointer(request: Request):
 def get_store(request: Request):
     """Return the global store (may be ``None`` if not configured)."""
     return getattr(request.app.state, "store", None)
+
+
+def get_run_event_store(request: Request) -> RunEventStore:
+    """Return the RunEventStore, or 503 if not available."""
+    store = getattr(request.app.state, "run_event_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Run event store not available")
+    return store
 
 
 def get_run_store(request: Request) -> RunStore:

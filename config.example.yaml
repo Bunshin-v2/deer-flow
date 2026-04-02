@@ -614,6 +614,20 @@ checkpointer:
 #   postgres_url: $DATABASE_URL
 
 # ============================================================================
+# Run Events Configuration
+# ============================================================================
+# Storage backend for run events (messages + execution traces).
+#
+# backend: memory  -- No persistence, data lost on restart (default)
+# backend: db      -- SQL database via ORM, full query capability (production)
+# backend: jsonl   -- Append-only JSONL files (lightweight single-node persistence)
+#
+# run_events:
+#   backend: memory
+#   max_trace_content: 10240    # Truncation threshold for trace content (db backend, bytes)
+#   track_token_usage: true     # Accumulate token counts to RunRow
+
+# ============================================================================
 # IM Channels Configuration
 # ============================================================================
 # Connect DeerFlow to external messaging platforms.
