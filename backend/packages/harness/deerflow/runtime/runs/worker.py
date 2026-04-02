@@ -45,12 +45,38 @@ async def run_agent(
     stream_subgraphs: bool = False,
     interrupt_before: list[str] | Literal["*"] | None = None,
     interrupt_after: list[str] | Literal["*"] | None = None,
+    event_store: Any | None = None,
+    run_events_config: Any | None = None,
 ) -> None:
     """Execute an agent in the background, publishing events to *bridge*."""
 
     run_id = record.run_id
     thread_id = record.thread_id
     requested_modes: set[str] = set(stream_modes or ["values"])
+
+    # Initialize RunJournal for event capture
+    journal = None
+    if event_store is not None:
+        from deerflow.runtime.journal import RunJournal
+
+        journal = RunJournal(
+            run_id=run_id,
+            thread_id=thread_id,
+            event_store=event_store,
+            track_token_usage=getattr(run_events_config, "track_token_usage", True),
+        )
+
+        # Write human_message event
+        user_input = _extract_user_input(graph_input)
+        if user_input:
+            await event_store.put(
+                thread_id=thread_id,
+                run_id=run_id,
+                event_type="human_message",
+                category="message",
+                content=user_input,
+            )
+            journal.set_first_human_message(user_input)
 
     # Track whether "events" was requested but skipped
     if "events" in requested_modes:
@@ -91,6 +117,10 @@ async def run_agent(
         # (langgraph-cli does this automatically; we must do it manually)
         runtime = Runtime(context={"thread_id": thread_id}, store=store)
         config.setdefault("configurable", {})["__pregel_runtime"] = runtime
+
+        # Inject RunJournal as a callback
+        if journal is not None:
+            config.setdefault("callbacks", []).append(journal)
 
         runnable_config = RunnableConfig(**config)
         agent = agent_factory(config=runnable_config)
@@ -206,6 +236,13 @@ async def run_agent(
         )
 
     finally:
+        # Flush any buffered journal events
+        if journal is not None:
+            try:
+                await journal.flush()
+            except Exception:
+                logger.warning("Failed to flush journal for run %s", run_id, exc_info=True)
+
         await bridge.publish_end(run_id)
         asyncio.create_task(bridge.cleanup(run_id, delay=60))
 
@@ -225,6 +262,23 @@ def _lg_mode_to_sse_event(mode: str) -> str:
     """
     # All LG modes map 1:1 to SSE event names — "messages" stays "messages"
     return mode
+
+
+def _extract_user_input(graph_input: dict) -> str:
+    """Extract user input text from graph_input for event recording."""
+    messages = graph_input.get("messages")
+    if not messages:
+        return ""
+    # Take the last message (usually the user's input)
+    last = messages[-1] if isinstance(messages, list) else messages
+    if isinstance(last, str):
+        return last
+    if hasattr(last, "content"):
+        content = last.content
+        return content if isinstance(content, str) else str(content)
+    if isinstance(last, dict):
+        return str(last.get("content", ""))
+    return ""
 
 
 def _unpack_stream_item(

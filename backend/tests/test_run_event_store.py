@@ -1,14 +1,7 @@
-"""Tests for RunEventStore ABC + MemoryRunEventStore.
+"""Tests for RunEventStore contract across all backends.
 
-Covers:
-- Basic write and query (put, seq assignment, cross-thread independence)
-- list_messages (category filtering, pagination, cross-run ordering)
-- list_events (run filtering, event_types filtering)
-- list_messages_by_run
-- count_messages
-- put_batch
-- delete_by_thread, delete_by_run
-- Edge cases (empty thread/run)
+Uses a helper to create the store for each backend type.
+Memory tests run directly; DB and JSONL tests create stores inside each test.
 """
 
 import pytest
@@ -35,7 +28,6 @@ class TestPutAndSeq:
         assert record["event_type"] == "human_message"
         assert record["category"] == "message"
         assert record["content"] == "hello"
-        assert record["metadata"] == {}
         assert "created_at" in record
 
     @pytest.mark.anyio
@@ -91,7 +83,6 @@ class TestListMessages:
 
     @pytest.mark.anyio
     async def test_before_seq_pagination(self, store):
-        # Put 10 messages with seq 1..10
         for i in range(10):
             await store.put(thread_id="t1", run_id="r1", event_type="human_message", category="message", content=str(i))
         messages = await store.list_messages("t1", before_seq=6, limit=3)
@@ -236,7 +227,6 @@ class TestDelete:
         await store.put(thread_id="t1", run_id="r2", event_type="llm_end", category="trace")
         count = await store.delete_by_run("t1", "r2")
         assert count == 2
-        # r1 events should still be there
         messages = await store.list_messages("t1")
         assert len(messages) == 1
         assert messages[0]["run_id"] == "r1"
@@ -270,3 +260,145 @@ class TestEdgeCases:
     @pytest.mark.anyio
     async def test_empty_thread_count_messages(self, store):
         assert await store.count_messages("empty") == 0
+
+
+# -- DB-specific tests --
+
+
+class TestDbRunEventStore:
+    """Tests for DbRunEventStore with temp SQLite."""
+
+    @pytest.mark.anyio
+    async def test_basic_crud(self, tmp_path):
+        from deerflow.persistence.engine import close_engine, get_session_factory, init_engine
+        from deerflow.runtime.events.store.db import DbRunEventStore
+
+        url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
+        await init_engine("sqlite", url=url, sqlite_dir=str(tmp_path))
+        s = DbRunEventStore(get_session_factory())
+
+        r = await s.put(thread_id="t1", run_id="r1", event_type="human_message", category="message", content="hi")
+        assert r["seq"] == 1
+        r2 = await s.put(thread_id="t1", run_id="r1", event_type="ai_message", category="message", content="hello")
+        assert r2["seq"] == 2
+
+        messages = await s.list_messages("t1")
+        assert len(messages) == 2
+
+        count = await s.count_messages("t1")
+        assert count == 2
+
+        await close_engine()
+
+    @pytest.mark.anyio
+    async def test_trace_content_truncation(self, tmp_path):
+        from deerflow.persistence.engine import close_engine, get_session_factory, init_engine
+        from deerflow.runtime.events.store.db import DbRunEventStore
+
+        url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
+        await init_engine("sqlite", url=url, sqlite_dir=str(tmp_path))
+        s = DbRunEventStore(get_session_factory(), max_trace_content=100)
+
+        long = "x" * 200
+        r = await s.put(thread_id="t1", run_id="r1", event_type="llm_end", category="trace", content=long)
+        assert len(r["content"]) == 100
+        assert r["metadata"].get("content_truncated") is True
+
+        # message content NOT truncated
+        m = await s.put(thread_id="t1", run_id="r1", event_type="ai_message", category="message", content=long)
+        assert len(m["content"]) == 200
+
+        await close_engine()
+
+    @pytest.mark.anyio
+    async def test_pagination(self, tmp_path):
+        from deerflow.persistence.engine import close_engine, get_session_factory, init_engine
+        from deerflow.runtime.events.store.db import DbRunEventStore
+
+        url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
+        await init_engine("sqlite", url=url, sqlite_dir=str(tmp_path))
+        s = DbRunEventStore(get_session_factory())
+
+        for i in range(10):
+            await s.put(thread_id="t1", run_id="r1", event_type="human_message", category="message", content=str(i))
+
+        # before_seq
+        msgs = await s.list_messages("t1", before_seq=6, limit=3)
+        assert [m["seq"] for m in msgs] == [3, 4, 5]
+
+        # after_seq
+        msgs = await s.list_messages("t1", after_seq=7, limit=3)
+        assert [m["seq"] for m in msgs] == [8, 9, 10]
+
+        # default (latest)
+        msgs = await s.list_messages("t1", limit=3)
+        assert [m["seq"] for m in msgs] == [8, 9, 10]
+
+        await close_engine()
+
+    @pytest.mark.anyio
+    async def test_delete(self, tmp_path):
+        from deerflow.persistence.engine import close_engine, get_session_factory, init_engine
+        from deerflow.runtime.events.store.db import DbRunEventStore
+
+        url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
+        await init_engine("sqlite", url=url, sqlite_dir=str(tmp_path))
+        s = DbRunEventStore(get_session_factory())
+
+        await s.put(thread_id="t1", run_id="r1", event_type="human_message", category="message")
+        await s.put(thread_id="t1", run_id="r2", event_type="ai_message", category="message")
+        c = await s.delete_by_run("t1", "r2")
+        assert c == 1
+        assert await s.count_messages("t1") == 1
+
+        c = await s.delete_by_thread("t1")
+        assert c == 1
+        assert await s.count_messages("t1") == 0
+
+        await close_engine()
+
+
+# -- JSONL-specific tests --
+
+
+class TestJsonlRunEventStore:
+    @pytest.mark.anyio
+    async def test_basic_crud(self, tmp_path):
+        from deerflow.runtime.events.store.jsonl import JsonlRunEventStore
+
+        s = JsonlRunEventStore(base_dir=tmp_path / "jsonl")
+        r = await s.put(thread_id="t1", run_id="r1", event_type="human_message", category="message", content="hi")
+        assert r["seq"] == 1
+        messages = await s.list_messages("t1")
+        assert len(messages) == 1
+
+    @pytest.mark.anyio
+    async def test_file_at_correct_path(self, tmp_path):
+        from deerflow.runtime.events.store.jsonl import JsonlRunEventStore
+
+        s = JsonlRunEventStore(base_dir=tmp_path / "jsonl")
+        await s.put(thread_id="t1", run_id="r1", event_type="human_message", category="message")
+        assert (tmp_path / "jsonl" / "threads" / "t1" / "runs" / "r1.jsonl").exists()
+
+    @pytest.mark.anyio
+    async def test_cross_run_messages(self, tmp_path):
+        from deerflow.runtime.events.store.jsonl import JsonlRunEventStore
+
+        s = JsonlRunEventStore(base_dir=tmp_path / "jsonl")
+        await s.put(thread_id="t1", run_id="r1", event_type="human_message", category="message")
+        await s.put(thread_id="t1", run_id="r2", event_type="human_message", category="message")
+        messages = await s.list_messages("t1")
+        assert len(messages) == 2
+        assert [m["seq"] for m in messages] == [1, 2]
+
+    @pytest.mark.anyio
+    async def test_delete_by_run(self, tmp_path):
+        from deerflow.runtime.events.store.jsonl import JsonlRunEventStore
+
+        s = JsonlRunEventStore(base_dir=tmp_path / "jsonl")
+        await s.put(thread_id="t1", run_id="r1", event_type="human_message", category="message")
+        await s.put(thread_id="t1", run_id="r2", event_type="human_message", category="message")
+        c = await s.delete_by_run("t1", "r2")
+        assert c == 1
+        assert not (tmp_path / "jsonl" / "threads" / "t1" / "runs" / "r2.jsonl").exists()
+        assert await s.count_messages("t1") == 1

@@ -31,32 +31,54 @@ async def langgraph_runtime(app: FastAPI) -> AsyncGenerator[None, None]:
     from deerflow.config import get_app_config
     from deerflow.persistence.engine import close_engine, init_engine_from_config
     from deerflow.runtime import make_store, make_stream_bridge
-    from deerflow.runtime.runs.store.memory import MemoryRunStore
 
     async with AsyncExitStack() as stack:
         app.state.stream_bridge = await stack.enter_async_context(make_stream_bridge())
         app.state.checkpointer = await stack.enter_async_context(make_checkpointer())
         app.state.store = await stack.enter_async_context(make_store())
-        app.state.run_manager = RunManager()
-
         # Initialize persistence layer from unified database config
         config = get_app_config()
         await init_engine_from_config(config.database)
 
-        # Initialize run store (MemoryRunStore for now; switch to ORM-backed
-        # RunRepository when models are implemented)
-        app.state.run_store = MemoryRunStore()
+        # Initialize run store (RunRepository if DB available, else MemoryRunStore)
+        app.state.run_store = _make_run_store()
 
-        # Initialize run event store (MemoryRunEventStore for now)
-        # TODO(Phase 2-B): switch to db/jsonl backend based on config.run_events.backend
-        from deerflow.runtime.events.store.memory import MemoryRunEventStore
+        # Initialize run event store based on config
+        app.state.run_event_store = _make_run_event_store(config)
 
-        app.state.run_event_store = MemoryRunEventStore()
+        # RunManager with store backing for persistence
+        app.state.run_manager = RunManager(store=app.state.run_store)
 
         try:
             yield
         finally:
             await close_engine()
+
+
+# ---------------------------------------------------------------------------
+# Factories
+# ---------------------------------------------------------------------------
+
+
+def _make_run_store() -> RunStore:
+    """Create a RunStore: RunRepository if DB engine is available, else MemoryRunStore."""
+    from deerflow.persistence.engine import get_session_factory
+
+    sf = get_session_factory()
+    if sf is not None:
+        from deerflow.persistence.repositories.run_repo import RunRepository
+
+        return RunRepository(sf)
+    from deerflow.runtime.runs.store.memory import MemoryRunStore
+
+    return MemoryRunStore()
+
+
+def _make_run_event_store(config) -> RunEventStore:
+    from deerflow.runtime.events.store import make_run_event_store
+
+    run_events_config = getattr(config, "run_events", None)
+    return make_run_event_store(run_events_config)
 
 
 # ---------------------------------------------------------------------------

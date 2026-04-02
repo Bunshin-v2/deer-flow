@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.gateway.deps import get_checkpointer, get_run_manager, get_stream_bridge
+from app.gateway.deps import get_checkpointer, get_run_event_store, get_run_manager, get_run_store, get_stream_bridge
 from app.gateway.services import sse_consumer, start_run
 from deerflow.runtime import RunRecord, serialize_channel_values
 
@@ -263,3 +263,77 @@ async def stream_existing_run(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Messages / Events / Token usage endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{thread_id}/messages")
+async def list_thread_messages(
+    thread_id: str,
+    request: Request,
+    limit: int = Query(default=50, le=200),
+    before_seq: int | None = Query(default=None),
+    after_seq: int | None = Query(default=None),
+) -> list[dict]:
+    """Return displayable messages for a thread (across all runs)."""
+    event_store = get_run_event_store(request)
+    return await event_store.list_messages(thread_id, limit=limit, before_seq=before_seq, after_seq=after_seq)
+
+
+@router.get("/{thread_id}/runs/{run_id}/messages")
+async def list_run_messages(thread_id: str, run_id: str, request: Request) -> list[dict]:
+    """Return displayable messages for a specific run."""
+    event_store = get_run_event_store(request)
+    return await event_store.list_messages_by_run(thread_id, run_id)
+
+
+@router.get("/{thread_id}/runs/{run_id}/events")
+async def list_run_events(
+    thread_id: str,
+    run_id: str,
+    request: Request,
+    event_types: str | None = Query(default=None),
+    limit: int = Query(default=500, le=2000),
+) -> list[dict]:
+    """Return the full event stream for a run (debug/audit)."""
+    event_store = get_run_event_store(request)
+    types = event_types.split(",") if event_types else None
+    return await event_store.list_events(thread_id, run_id, event_types=types, limit=limit)
+
+
+@router.get("/{thread_id}/token-usage")
+async def thread_token_usage(thread_id: str, request: Request) -> dict:
+    """Thread-level token usage aggregation."""
+    run_store = get_run_store(request)
+    runs = await run_store.list_by_thread(thread_id, limit=10000)
+    completed = [r for r in runs if r.get("status") in ("success", "error")]
+
+    total_tokens = sum(r.get("total_tokens", 0) for r in completed)
+    total_input = sum(r.get("total_input_tokens", 0) for r in completed)
+    total_output = sum(r.get("total_output_tokens", 0) for r in completed)
+
+    by_model: dict[str, dict] = {}
+    for r in completed:
+        model = r.get("model_name") or "unknown"
+        entry = by_model.setdefault(model, {"tokens": 0, "runs": 0})
+        entry["tokens"] += r.get("total_tokens", 0)
+        entry["runs"] += 1
+
+    by_caller = {
+        "lead_agent": sum(r.get("lead_agent_tokens", 0) for r in completed),
+        "subagent": sum(r.get("subagent_tokens", 0) for r in completed),
+        "middleware": sum(r.get("middleware_tokens", 0) for r in completed),
+    }
+
+    return {
+        "thread_id": thread_id,
+        "total_tokens": total_tokens,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_runs": len(completed),
+        "by_model": by_model,
+        "by_caller": by_caller,
+    }

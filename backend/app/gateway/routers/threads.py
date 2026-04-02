@@ -63,6 +63,7 @@ class ThreadCreateRequest(BaseModel):
     """Request body for creating a thread."""
 
     thread_id: str | None = Field(default=None, description="Optional thread ID (auto-generated if omitted)")
+    assistant_id: str | None = Field(default=None, description="Associate thread with an assistant")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Initial metadata")
 
 

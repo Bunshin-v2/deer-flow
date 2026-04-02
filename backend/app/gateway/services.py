@@ -17,7 +17,7 @@ from typing import Any
 from fastapi import HTTPException, Request
 from langchain_core.messages import HumanMessage
 
-from app.gateway.deps import get_checkpointer, get_run_manager, get_store, get_stream_bridge
+from app.gateway.deps import get_checkpointer, get_run_event_store, get_run_manager, get_store, get_stream_bridge
 from deerflow.runtime import (
     END_SENTINEL,
     HEARTBEAT_SENTINEL,
@@ -245,6 +245,12 @@ async def start_run(
     run_mgr = get_run_manager(request)
     checkpointer = get_checkpointer(request)
     store = get_store(request)
+    event_store = get_run_event_store(request)
+
+    # Get run_events config for journal
+    from deerflow.config import get_app_config
+
+    run_events_config = getattr(get_app_config(), "run_events", None)
 
     disconnect = DisconnectMode.cancel if body.on_disconnect == "cancel" else DisconnectMode.continue_
 
@@ -287,6 +293,8 @@ async def start_run(
             stream_subgraphs=body.stream_subgraphs,
             interrupt_before=body.interrupt_before,
             interrupt_after=body.interrupt_after,
+            event_store=event_store,
+            run_events_config=run_events_config,
         )
     )
     record.task = task
