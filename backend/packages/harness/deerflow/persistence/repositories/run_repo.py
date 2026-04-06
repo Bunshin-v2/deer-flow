@@ -11,7 +11,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.persistence.models.run import RunRow
@@ -171,3 +171,52 @@ class RunRepository(RunStore):
         async with self._sf() as session:
             await session.execute(update(RunRow).where(RunRow.run_id == run_id).values(**values))
             await session.commit()
+
+    async def aggregate_tokens_by_thread(self, thread_id: str) -> dict[str, Any]:
+        """Aggregate token usage via a single SQL GROUP BY query."""
+        _completed = RunRow.status.in_(("success", "error"))
+        _thread = RunRow.thread_id == thread_id
+
+        stmt = (
+            select(
+                func.coalesce(RunRow.model_name, "unknown").label("model"),
+                func.count().label("runs"),
+                func.coalesce(func.sum(RunRow.total_tokens), 0).label("total_tokens"),
+                func.coalesce(func.sum(RunRow.total_input_tokens), 0).label("total_input_tokens"),
+                func.coalesce(func.sum(RunRow.total_output_tokens), 0).label("total_output_tokens"),
+                func.coalesce(func.sum(RunRow.lead_agent_tokens), 0).label("lead_agent"),
+                func.coalesce(func.sum(RunRow.subagent_tokens), 0).label("subagent"),
+                func.coalesce(func.sum(RunRow.middleware_tokens), 0).label("middleware"),
+            )
+            .where(_thread, _completed)
+            .group_by(func.coalesce(RunRow.model_name, "unknown"))
+        )
+
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).all()
+
+        total_tokens = total_input = total_output = total_runs = 0
+        lead_agent = subagent = middleware = 0
+        by_model: dict[str, dict] = {}
+        for r in rows:
+            by_model[r.model] = {"tokens": r.total_tokens, "runs": r.runs}
+            total_tokens += r.total_tokens
+            total_input += r.total_input_tokens
+            total_output += r.total_output_tokens
+            total_runs += r.runs
+            lead_agent += r.lead_agent
+            subagent += r.subagent
+            middleware += r.middleware
+
+        return {
+            "total_tokens": total_tokens,
+            "total_input_tokens": total_input,
+            "total_output_tokens": total_output,
+            "total_runs": total_runs,
+            "by_model": by_model,
+            "by_caller": {
+                "lead_agent": lead_agent,
+                "subagent": subagent,
+                "middleware": middleware,
+            },
+        }

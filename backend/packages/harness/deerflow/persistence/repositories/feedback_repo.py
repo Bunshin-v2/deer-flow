@@ -8,7 +8,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.persistence.models.feedback import FeedbackRow
@@ -82,13 +82,17 @@ class FeedbackRepository:
             return True
 
     async def aggregate_by_run(self, thread_id: str, run_id: str) -> dict:
-        """Aggregate feedback stats for a run."""
-        items = await self.list_by_run(thread_id, run_id, limit=10000)
-        positive = sum(1 for i in items if i["rating"] == 1)
-        negative = sum(1 for i in items if i["rating"] == -1)
-        return {
-            "run_id": run_id,
-            "total": len(items),
-            "positive": positive,
-            "negative": negative,
-        }
+        """Aggregate feedback stats for a run using database-side counting."""
+        stmt = select(
+            func.count().label("total"),
+            func.coalesce(func.sum(case((FeedbackRow.rating == 1, 1), else_=0)), 0).label("positive"),
+            func.coalesce(func.sum(case((FeedbackRow.rating == -1, 1), else_=0)), 0).label("negative"),
+        ).where(FeedbackRow.thread_id == thread_id, FeedbackRow.run_id == run_id)
+        async with self._sf() as session:
+            row = (await session.execute(stmt)).one()
+            return {
+                "run_id": run_id,
+                "total": row.total,
+                "positive": row.positive,
+                "negative": row.negative,
+            }

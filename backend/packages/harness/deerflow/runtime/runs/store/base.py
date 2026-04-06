@@ -84,3 +84,13 @@ class RunStore(abc.ABC):
     @abc.abstractmethod
     async def list_pending(self, *, before: str | None = None) -> list[dict[str, Any]]:
         pass
+
+    @abc.abstractmethod
+    async def aggregate_tokens_by_thread(self, thread_id: str) -> dict[str, Any]:
+        """Aggregate token usage for completed runs in a thread.
+
+        Returns a dict with keys: total_tokens, total_input_tokens,
+        total_output_tokens, total_runs, by_model (model_name → {tokens, runs}),
+        by_caller ({lead_agent, subagent, middleware}).
+        """
+        pass

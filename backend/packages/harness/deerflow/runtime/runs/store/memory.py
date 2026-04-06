@@ -77,3 +77,24 @@ class MemoryRunStore(RunStore):
         results = [r for r in self._runs.values() if r["status"] == "pending" and r["created_at"] <= now]
         results.sort(key=lambda r: r["created_at"])
         return results
+
+    async def aggregate_tokens_by_thread(self, thread_id: str) -> dict[str, Any]:
+        completed = [r for r in self._runs.values() if r["thread_id"] == thread_id and r.get("status") in ("success", "error")]
+        by_model: dict[str, dict] = {}
+        for r in completed:
+            model = r.get("model_name") or "unknown"
+            entry = by_model.setdefault(model, {"tokens": 0, "runs": 0})
+            entry["tokens"] += r.get("total_tokens", 0)
+            entry["runs"] += 1
+        return {
+            "total_tokens": sum(r.get("total_tokens", 0) for r in completed),
+            "total_input_tokens": sum(r.get("total_input_tokens", 0) for r in completed),
+            "total_output_tokens": sum(r.get("total_output_tokens", 0) for r in completed),
+            "total_runs": len(completed),
+            "by_model": by_model,
+            "by_caller": {
+                "lead_agent": sum(r.get("lead_agent_tokens", 0) for r in completed),
+                "subagent": sum(r.get("subagent_tokens", 0) for r in completed),
+                "middleware": sum(r.get("middleware_tokens", 0) for r in completed),
+            },
+        }

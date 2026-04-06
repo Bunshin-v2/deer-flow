@@ -310,32 +310,5 @@ async def list_run_events(
 async def thread_token_usage(thread_id: str, request: Request) -> dict:
     """Thread-level token usage aggregation."""
     run_store = get_run_store(request)
-    runs = await run_store.list_by_thread(thread_id, limit=10000)
-    completed = [r for r in runs if r.get("status") in ("success", "error")]
-
-    total_tokens = sum(r.get("total_tokens", 0) for r in completed)
-    total_input = sum(r.get("total_input_tokens", 0) for r in completed)
-    total_output = sum(r.get("total_output_tokens", 0) for r in completed)
-
-    by_model: dict[str, dict] = {}
-    for r in completed:
-        model = r.get("model_name") or "unknown"
-        entry = by_model.setdefault(model, {"tokens": 0, "runs": 0})
-        entry["tokens"] += r.get("total_tokens", 0)
-        entry["runs"] += 1
-
-    by_caller = {
-        "lead_agent": sum(r.get("lead_agent_tokens", 0) for r in completed),
-        "subagent": sum(r.get("subagent_tokens", 0) for r in completed),
-        "middleware": sum(r.get("middleware_tokens", 0) for r in completed),
-    }
-
-    return {
-        "thread_id": thread_id,
-        "total_tokens": total_tokens,
-        "total_input_tokens": total_input,
-        "total_output_tokens": total_output,
-        "total_runs": len(completed),
-        "by_model": by_model,
-        "by_caller": by_caller,
-    }
+    agg = await run_store.aggregate_tokens_by_thread(thread_id)
+    return {"thread_id": thread_id, **agg}
