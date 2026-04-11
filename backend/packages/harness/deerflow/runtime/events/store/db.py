@@ -62,9 +62,15 @@ class DbRunEventStore(RunEventStore):
         which is the expected case for background worker writes. HTTP
         request writes will have the contextvar set by auth middleware
         and get their user_id stamped automatically.
+
+        Coerces ``user.id`` to ``str`` at the boundary: ``User.id`` is
+        typed as ``UUID`` by the auth layer, but ``run_events.user_id``
+        is ``VARCHAR(64)`` and aiosqlite cannot bind a raw UUID object
+        to a VARCHAR column ("type 'UUID' is not supported") — the
+        INSERT would silently roll back and the worker would hang.
         """
         user = get_current_user()
-        return user.id if user is not None else None
+        return str(user.id) if user is not None else None
 
     async def put(self, *, thread_id, run_id, event_type, category, content="", metadata=None, created_at=None):  # noqa: D401
         """Write a single event — low-frequency path only.

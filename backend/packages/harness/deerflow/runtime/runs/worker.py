@@ -143,34 +143,7 @@ async def run_agent(
             content = human_msg.content
             journal.set_first_human_message(content if isinstance(content, str) else str(content))
 
-    # Initialize RunJournal for event capture
     journal = None
-    if event_store is not None:
-        from deerflow.runtime.journal import RunJournal
-
-        journal = RunJournal(
-            run_id=run_id,
-            thread_id=thread_id,
-            event_store=event_store,
-            track_token_usage=getattr(run_events_config, "track_token_usage", True),
-        )
-
-        # Write human_message event (model_dump format, aligned with checkpoint)
-        human_msg = _extract_human_message(graph_input)
-        if human_msg is not None:
-            msg_metadata = {}
-            if follow_up_to_run_id:
-                msg_metadata["follow_up_to_run_id"] = follow_up_to_run_id
-            await event_store.put(
-                thread_id=thread_id,
-                run_id=run_id,
-                event_type="human_message",
-                category="message",
-                content=human_msg.model_dump(),
-                metadata=msg_metadata or None,
-            )
-            content = human_msg.content
-            journal.set_first_human_message(content if isinstance(content, str) else str(content))
 
     # Track whether "events" was requested but skipped
     if "events" in requested_modes:
@@ -180,6 +153,38 @@ async def run_agent(
         )
 
     try:
+        # Initialize RunJournal + write human_message event.
+        # These are inside the try block so any exception (e.g. a DB
+        # error writing the event) flows through the except/finally
+        # path that publishes an "end" event to the SSE bridge —
+        # otherwise a failure here would leave the stream hanging
+        # with no terminator.
+        if event_store is not None:
+            from deerflow.runtime.journal import RunJournal
+
+            journal = RunJournal(
+                run_id=run_id,
+                thread_id=thread_id,
+                event_store=event_store,
+                track_token_usage=getattr(run_events_config, "track_token_usage", True),
+            )
+
+            human_msg = _extract_human_message(graph_input)
+            if human_msg is not None:
+                msg_metadata = {}
+                if follow_up_to_run_id:
+                    msg_metadata["follow_up_to_run_id"] = follow_up_to_run_id
+                await event_store.put(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    event_type="human_message",
+                    category="message",
+                    content=human_msg.model_dump(),
+                    metadata=msg_metadata or None,
+                )
+                content = human_msg.content
+                journal.set_first_human_message(content if isinstance(content, str) else str(content))
+
         # 1. Mark running
         await run_manager.set_status(run_id, RunStatus.running)
 
@@ -363,12 +368,15 @@ async def run_agent(
             except Exception:
                 logger.warning("Failed to flush journal for run %s", run_id, exc_info=True)
 
-            # Persist token usage + convenience fields to RunStore
-            completion = journal.get_completion_data()
-            await run_manager.update_run_completion(run_id, status=record.status.value, **completion)
+            try:
+                # Persist token usage + convenience fields to RunStore
+                completion = journal.get_completion_data()
+                await run_manager.update_run_completion(run_id, status=record.status.value, **completion)
+            except Exception:
+                logger.warning("Failed to persist run completion for %s (non-fatal)", run_id, exc_info=True)
 
         # Sync title from checkpoint to threads_meta.display_name
-        if checkpointer is not None:
+        if checkpointer is not None and thread_store is not None:
             try:
                 ckpt_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
                 ckpt_tuple = await checkpointer.aget_tuple(ckpt_config)
@@ -381,11 +389,12 @@ async def run_agent(
                 logger.debug("Failed to sync title for thread %s (non-fatal)", thread_id)
 
         # Update threads_meta status based on run outcome
-        try:
-            final_status = "idle" if record.status == RunStatus.success else record.status.value
-            await thread_store.update_status(thread_id, final_status)
-        except Exception:
-            logger.debug("Failed to update thread_meta status for %s (non-fatal)", thread_id)
+        if thread_store is not None:
+            try:
+                final_status = "idle" if record.status == RunStatus.success else record.status.value
+                await thread_store.update_status(thread_id, final_status)
+            except Exception:
+                logger.debug("Failed to update thread_meta status for %s (non-fatal)", thread_id)
 
         await bridge.publish_end(run_id)
         asyncio.create_task(bridge.cleanup(run_id, delay=60))

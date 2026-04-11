@@ -50,6 +50,7 @@ class RunJournal(BaseCallbackHandler):
 
         # Write buffer
         self._buffer: list[dict] = []
+        self._pending_flush_tasks: set[asyncio.Task[None]] = set()
 
         # Token accumulators
         self._total_input_tokens = 0
@@ -381,6 +382,10 @@ class RunJournal(BaseCallbackHandler):
         """
         if not self._buffer:
             return
+        # Skip if a flush is already in flight — avoids concurrent writes
+        # to the same SQLite file from multiple fire-and-forget tasks.
+        if self._pending_flush_tasks:
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -389,6 +394,7 @@ class RunJournal(BaseCallbackHandler):
         batch = self._buffer.copy()
         self._buffer.clear()
         task = loop.create_task(self._flush_async(batch))
+        self._pending_flush_tasks.add(task)
         task.add_done_callback(self._on_flush_done)
 
     async def _flush_async(self, batch: list[dict]) -> None:
@@ -404,8 +410,8 @@ class RunJournal(BaseCallbackHandler):
             # Return failed events to buffer for retry on next flush
             self._buffer = batch + self._buffer
 
-    @staticmethod
-    def _on_flush_done(task: asyncio.Task) -> None:
+    def _on_flush_done(self, task: asyncio.Task) -> None:
+        self._pending_flush_tasks.discard(task)
         if task.cancelled():
             return
         exc = task.exception()
@@ -450,10 +456,17 @@ class RunJournal(BaseCallbackHandler):
 
     async def flush(self) -> None:
         """Force flush remaining buffer. Called in worker's finally block."""
-        if self._buffer:
-            batch = self._buffer.copy()
-            self._buffer.clear()
-            await self._store.put_batch(batch)
+        if self._pending_flush_tasks:
+            await asyncio.gather(*tuple(self._pending_flush_tasks), return_exceptions=True)
+
+        while self._buffer:
+            batch = self._buffer[: self._flush_threshold]
+            del self._buffer[: self._flush_threshold]
+            try:
+                await self._store.put_batch(batch)
+            except Exception:
+                self._buffer = batch + self._buffer
+                raise
 
     def get_completion_data(self) -> dict:
         """Return accumulated token and message data for run completion."""
